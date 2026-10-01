@@ -131,6 +131,30 @@ public class InitialHandler extends PacketHandler implements PendingConnection
             throw new UnsupportedOperationException( "Not supported" );
         }
     };
+
+    /**
+     * Connection mode, set by Bootstrap.main from args[0].
+     *
+     *   null      -> use config.yml's online_mode (default)
+     *   OFFLINE   -> offline mode, plain offline UUIDs, no Mojang lookup
+     *   ONLINE    -> offline mode, but resolve the real Mojang UUID per player
+     */
+    public enum UuidMode
+    {
+        OFFLINE,
+        ONLINE
+    }
+
+    /** When non-null, overrides config.yml's online_mode handling. */
+    public static UuidMode forcedUuidMode = null;
+
+    /**
+     * When non-null, every offline-mode player gets this UUID instead of a
+     * per-username Mojang lookup. Set by BungeeCord.main from args[0].
+     * The player's NAME is not affected — only the UUID.
+     */
+    public static UUID forcedUuid = null;
+
     @Getter
     private boolean onlineMode = BungeeCord.getInstance().config.isOnlineMode();
     @Getter
@@ -558,10 +582,47 @@ public class InitialHandler extends PacketHandler implements PendingConnection
     private void finish()
     {
         offlineId = UUID.nameUUIDFromBytes( ( "OfflinePlayer:" + getName() ).getBytes( StandardCharsets.UTF_8 ) );
+
         if ( uniqueId == null )
         {
-            uniqueId = offlineId;
+            // Offline mode.
+
+            // CLI forced "offline" -> plain offline UUID, no Mojang lookup.
+            if ( forcedUuidMode == UuidMode.OFFLINE )
+            {
+                uniqueId = offlineId;
+                finish( uniqueId );
+                return;
+            }
+
+            // If the operator forced a UUID via the CLI argument, use it for
+            // everyone. The player's NAME stays as whatever they logged in as.
+            if ( forcedUuid != null )
+            {
+                uniqueId = forcedUuid;
+                finish( uniqueId );
+                return;
+            }
+
+            // Default + CLI "online" mode: look up the real Mojang UUID.
+            lookupMojangUUID( getName(), (mojangId, error) ->
+            {
+                if ( error != null )
+                {
+                    bungee.getLogger().log( Level.WARNING, "Mojang UUID lookup failed for " + getName(), error );
+                }
+                uniqueId = ( mojangId != null ) ? mojangId : offlineId;
+                finish( uniqueId );
+            } );
+            return;
         }
+
+        finish( uniqueId );
+    }
+
+    private void finish(UUID resolvedUniqueId)
+    {
+        this.uniqueId = resolvedUniqueId;
         rewriteId = ( bungee.config.isIpForward() ) ? uniqueId : offlineId;
 
         if ( BungeeCord.getInstance().config.isEnforceSecureProfile() )
@@ -666,6 +727,64 @@ public class InitialHandler extends PacketHandler implements PendingConnection
 
         // fire post-login event
         bungee.getPluginManager().callEvent( new PostLoginEvent( userCon, initialServer, eventLoopCallback( complete ) ) );
+    }
+
+    /**
+     * Asynchronously looks up the real Mojang UUID for the given username.
+     * Called only when online_mode is false (offline mode), and only when
+     * no forced UUID was provided on the command line.
+     *
+     * @param username the player's username
+     * @param callback called with the Mojang UUID, or {@code null} if the
+     *                 lookup failed / the player does not exist
+     */
+    private void lookupMojangUUID(String username, Callback<UUID> callback)
+    {
+        final String lookupURL;
+        try
+        {
+            lookupURL = "https://api.mojang.com/users/profiles/minecraft/"
+                    + URLEncoder.encode( username, "UTF-8" );
+        } catch ( Exception ex )
+        {
+            callback.done( null, ex );
+            return;
+        }
+
+        HttpClient.get( lookupURL, ch.getHandle().eventLoop(), new Callback<String>()
+        {
+            @Override
+            public void done(String result, Throwable error)
+            {
+                if ( error != null || result == null || result.isEmpty() )
+                {
+                    if ( error != null )
+                    {
+                        bungee.getLogger().log( Level.WARNING,
+                                "Failed to look up Mojang UUID for " + username, error );
+                    }
+                    callback.done( null, null );
+                    return;
+                }
+
+                try
+                {
+                    LoginResult obj = LoginResult.GSON.fromJson( result, LoginResult.class );
+                    if ( obj != null && obj.getId() != null )
+                    {
+                        callback.done( Util.getUUID( obj.getId() ), null );
+                    } else
+                    {
+                        callback.done( null, null );
+                    }
+                } catch ( Exception ex )
+                {
+                    bungee.getLogger().log( Level.WARNING,
+                            "Failed to parse Mojang UUID response for " + username, ex );
+                    callback.done( null, ex );
+                }
+            }
+        } );
     }
 
     @Override
